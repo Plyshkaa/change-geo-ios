@@ -1,0 +1,9 @@
+iOS Location Controller is distributed under GPL-3.0.
+
+The complete application source code and build scripts for this release are
+included in the SOURCE directory. The public project is available at:
+https://github.com/Plyshkaa/change-geo-ios
+
+Exact source distributions for bundled GPL/LGPL dependencies are included in
+the THIRD_PARTY_SOURCES directory. Third-party packages remain subject to their
+respective licenses listed in THIRD_PARTY_NOTICES/THIRD_PARTY_NOTICES.txt.

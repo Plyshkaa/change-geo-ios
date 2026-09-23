@@ -1,0 +1,18 @@
+[project]
+name = "ios-location-controller"
+version = "0.2.0"
+description = "Personal macOS-side controller for iOS location simulation"
+requires-python = ">=3.11"
+dependencies = [
+    "pymobiledevice3==11.17.0",
+]
+
+[project.optional-dependencies]
+portable = ["pyinstaller>=6,<7"]
+
+[project.scripts]
+locationctl = "locationctl:main"
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"

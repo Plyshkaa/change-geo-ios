@@ -1,0 +1,4 @@
+The hexdump 3.3 package metadata identifies this software as Public Domain.
+
+Project: https://bitbucket.org/techtonik/hexdump/
+Author: Anatoly Techtonik
