@@ -22,6 +22,20 @@ private struct OSRMGeometry: Decodable {
     let coordinates: [[Double]]
 }
 
+private struct OSMSearchResult: Decodable {
+    let latitude: String
+    let longitude: String
+    let displayName: String
+    let boundingBox: [String]?
+
+    private enum CodingKeys: String, CodingKey {
+        case latitude = "lat"
+        case longitude = "lon"
+        case displayName = "display_name"
+        case boundingBox = "boundingbox"
+    }
+}
+
 private final class ClickableMapView: MKMapView {
     var onMapClick: ((CLLocationCoordinate2D) -> Void)?
 
@@ -42,12 +56,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, MKMapViewDelegate, NST
     private var routeTask: URLSessionDataTask?
     private var osmRouteWorkItem: DispatchWorkItem?
     private var lastOSMRequestDate: Date?
+    private var localSearch: MKLocalSearch?
+    private var searchTask: URLSessionDataTask?
+    private var searchWorkItem: DispatchWorkItem?
+    private var lastOSMSearchDate: Date?
+    private var searchGeneration = 0
     private lazy var routingSession = URLSession(configuration: .ephemeral)
     private var routeCoordinates: [CLLocationCoordinate2D] = []
     private var routeDistance = 0.0
     private var routeGeneration = 0
+    private var routeUsesOpenStreetMap = false
+    private var searchUsesOpenStreetMap = false
     private var isWaitingForMacLocation = false
     private var locationRequestID = 0
+    private var movementTimer: Timer?
+    private var movementStartDate: Date?
+    private var movementCoordinates: [CLLocationCoordinate2D] = []
+    private var movementCumulativeDistances: [CLLocationDistance] = []
+    private var movementTotalDistance: CLLocationDistance = 0
+    private var movementSpeedMetersPerSecond = 0.0
+    private var movementReturnsToStart = false
 
     private let modeControl = NSSegmentedControl(labels: ["Точка", "Маршрут"], trackingMode: .selectOne, target: nil, action: nil)
     private let selectionControl = NSSegmentedControl(labels: ["Начало", "Конец"], trackingMode: .selectOne, target: nil, action: nil)
@@ -55,6 +83,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, MKMapViewDelegate, NST
     private let directionControl = NSSegmentedControl(labels: ["В одну сторону", "Туда и обратно"], trackingMode: .selectOne, target: nil, action: nil)
     private let latitudeField = NSTextField(string: "")
     private let longitudeField = NSTextField(string: "")
+    private let searchField = NSSearchField()
     private let devicePicker = NSPopUpButton()
     private var deviceIDs: [String] = []
 
@@ -72,9 +101,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, MKMapViewDelegate, NST
     private var startCoordinate: CLLocationCoordinate2D?
     private var endCoordinate: CLLocationCoordinate2D?
     private var routeOverlay: MKPolyline?
+    private var routeOutlineOverlay: MKPolyline?
     private var startAnnotation: MKPointAnnotation?
     private var endAnnotation: MKPointAnnotation?
     private var macLocationAnnotation: MKPointAnnotation?
+    private var movementAnnotation: MKPointAnnotation?
+    private var searchAnnotation: MKPointAnnotation?
 
     private var projectRoot: URL {
         if let configured = ProcessInfo.processInfo.environment["LOCATION_CONTROLLER_ROOT"] {
@@ -106,7 +138,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, MKMapViewDelegate, NST
     func applicationDidFinishLaunching(_ notification: Notification) {
         cleanupStaleTemporaryGPX()
         locationManager.delegate = self
-        locationManager.desiredAccuracy = kCLLocationAccuracyHundredMeters
+        locationManager.desiredAccuracy = kCLLocationAccuracyKilometer
+        locationManager.distanceFilter = kCLDistanceFilterNone
         let content = makeContentView()
         window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 1060, height: 700),
@@ -125,6 +158,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, MKMapViewDelegate, NST
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         osmRouteWorkItem?.cancel()
+        localSearch?.cancel()
+        searchTask?.cancel()
+        searchWorkItem?.cancel()
         routingSession.invalidateAndCancel()
         stopSession()
         return .terminateNow
@@ -152,6 +188,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, MKMapViewDelegate, NST
         let root = NSView()
         root.addSubview(mapView)
         root.addSubview(sidebar)
+
+        let searchPanel = NSBox()
+        searchPanel.boxType = .custom
+        searchPanel.fillColor = .windowBackgroundColor
+        searchPanel.borderColor = .separatorColor
+        searchPanel.borderWidth = 1
+        searchPanel.cornerRadius = 10
+        searchPanel.translatesAutoresizingMaskIntoConstraints = false
+        searchField.translatesAutoresizingMaskIntoConstraints = false
+        let searchContent = NSView()
+        searchContent.addSubview(searchField)
+        searchPanel.contentView = searchContent
+        root.addSubview(searchPanel)
+
         let locateButton = NSButton(image: NSImage(systemSymbolName: "location.north.fill", accessibilityDescription: "К моей позиции") ?? NSImage(), target: self, action: #selector(centerOnMyLocation))
         locateButton.bezelStyle = .regularSquare
         locateButton.toolTip = "К моей позиции (геопозиция Mac)"
@@ -176,6 +226,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, MKMapViewDelegate, NST
             mapView.trailingAnchor.constraint(equalTo: root.trailingAnchor),
             mapView.topAnchor.constraint(equalTo: root.topAnchor),
             mapView.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+            searchPanel.leadingAnchor.constraint(equalTo: mapView.leadingAnchor, constant: 16),
+            searchPanel.topAnchor.constraint(equalTo: root.topAnchor, constant: 70),
+            searchPanel.widthAnchor.constraint(equalToConstant: 360),
+            searchPanel.heightAnchor.constraint(equalToConstant: 54),
+            searchPanel.trailingAnchor.constraint(lessThanOrEqualTo: locateButton.leadingAnchor, constant: -12),
+            searchField.leadingAnchor.constraint(equalTo: searchContent.leadingAnchor, constant: 10),
+            searchField.trailingAnchor.constraint(equalTo: searchContent.trailingAnchor, constant: -10),
+            searchField.centerYAnchor.constraint(equalTo: searchContent.centerYAnchor),
+            searchField.heightAnchor.constraint(equalToConstant: 32),
             locateButton.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -16),
             locateButton.topAnchor.constraint(equalTo: root.topAnchor, constant: 16),
             locateButton.widthAnchor.constraint(equalToConstant: 38),
@@ -191,44 +250,74 @@ final class AppDelegate: NSObject, NSApplicationDelegate, MKMapViewDelegate, NST
         NSWorkspace.shared.open(url)
     }
 
+    private var hasMacLocationAuthorization: Bool {
+        switch locationManager.authorizationStatus {
+        case .authorizedAlways, .authorizedWhenInUse:
+            return true
+        default:
+            return false
+        }
+    }
+
     @objc private func centerOnMyLocation() {
         guard CLLocationManager.locationServicesEnabled() else {
             statusLabel.stringValue = "Службы геолокации Mac выключены"
             return
         }
-        if let location = locationManager.location, abs(location.timestamp.timeIntervalSinceNow) < 60 {
-            let coordinate = location.coordinate
-            centerMap(on: coordinate)
+
+        if let location = locationManager.location,
+           location.horizontalAccuracy >= 0,
+           location.horizontalAccuracy <= 10_000,
+           abs(location.timestamp.timeIntervalSinceNow) < 300 {
+            centerMap(on: location.coordinate)
             return
         }
+
         isWaitingForMacLocation = true
         locationRequestID += 1
         let requestID = locationRequestID
-        if locationManager.authorizationStatus == .notDetermined {
-            locationManager.requestWhenInUseAuthorization()
-        } else if locationManager.authorizationStatus == .authorizedAlways {
-            locationManager.startUpdatingLocation()
-        } else {
-            isWaitingForMacLocation = false
-            statusLabel.stringValue = "Разрешите доступ к геопозиции Mac в Системных настройках"
-            return
-        }
         statusLabel.stringValue = "Определяю позицию Mac..."
-        DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [weak self] in
+
+        switch locationManager.authorizationStatus {
+        case .notDetermined:
+            locationManager.requestWhenInUseAuthorization()
+        case .authorizedAlways, .authorizedWhenInUse:
+            beginMacLocationUpdates()
+        case .denied, .restricted:
+            isWaitingForMacLocation = false
+            statusLabel.stringValue = "Разрешите геопозицию для iOS Location Controller в Системных настройках → Конфиденциальность и безопасность → Службы геолокации"
+        @unknown default:
+            isWaitingForMacLocation = false
+            statusLabel.stringValue = "macOS вернула неизвестный статус разрешения геопозиции"
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 20) { [weak self] in
             guard let self, self.isWaitingForMacLocation, self.locationRequestID == requestID else { return }
             self.isWaitingForMacLocation = false
             self.locationManager.stopUpdatingLocation()
-            self.statusLabel.stringValue = "macOS не определила позицию Mac. Выберите точку на карте или введите координаты."
+            self.statusLabel.stringValue = "macOS не определила позицию. Проверьте Wi‑Fi и Службы геолокации, затем нажмите кнопку ещё раз."
         }
+    }
+
+    private func beginMacLocationUpdates() {
+        guard isWaitingForMacLocation, hasMacLocationAuthorization else { return }
+        locationManager.stopUpdatingLocation()
+        locationManager.requestLocation()
     }
 
     func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
         guard isWaitingForMacLocation else { return }
-        if manager.authorizationStatus == .authorizedAlways {
-            manager.startUpdatingLocation()
-        } else if manager.authorizationStatus != .notDetermined {
+        switch manager.authorizationStatus {
+        case .authorizedAlways, .authorizedWhenInUse:
+            beginMacLocationUpdates()
+        case .notDetermined:
+            break
+        case .denied, .restricted:
             isWaitingForMacLocation = false
-            statusLabel.stringValue = "Разрешите доступ к геопозиции Mac в Системных настройках"
+            statusLabel.stringValue = "Разрешите геопозицию для iOS Location Controller в Системных настройках → Конфиденциальность и безопасность → Службы геолокации"
+        @unknown default:
+            isWaitingForMacLocation = false
+            statusLabel.stringValue = "macOS вернула неизвестный статус разрешения геопозиции"
         }
     }
 
@@ -250,22 +339,171 @@ final class AppDelegate: NSObject, NSApplicationDelegate, MKMapViewDelegate, NST
     }
 
     func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
-        guard let coordinate = locations.last?.coordinate else { return }
-        if isWaitingForMacLocation {
-            isWaitingForMacLocation = false
-            manager.stopUpdatingLocation()
-            centerMap(on: coordinate)
-        }
+        guard isWaitingForMacLocation,
+              let location = locations.last(where: { $0.horizontalAccuracy >= 0 }),
+              CLLocationCoordinate2DIsValid(location.coordinate) else { return }
+        isWaitingForMacLocation = false
+        manager.stopUpdatingLocation()
+        centerMap(on: location.coordinate)
     }
 
     func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
         let locationError = error as NSError
         if locationError.domain == kCLErrorDomain && locationError.code == CLError.locationUnknown.rawValue {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self, weak manager] in
+                guard let self, let manager, self.isWaitingForMacLocation, self.hasMacLocationAuthorization else { return }
+                manager.requestLocation()
+            }
             return
         }
         isWaitingForMacLocation = false
         manager.stopUpdatingLocation()
         statusLabel.stringValue = "Позиция Mac недоступна: \(error.localizedDescription)"
+    }
+
+    @objc private func searchLocation() {
+        let query = searchField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else {
+            statusLabel.stringValue = "Введите город, улицу или адрес"
+            return
+        }
+
+        searchGeneration += 1
+        let generation = searchGeneration
+        localSearch?.cancel()
+        searchTask?.cancel()
+        searchWorkItem?.cancel()
+
+        let request = MKLocalSearch.Request()
+        request.naturalLanguageQuery = query
+        request.region = mapView.region
+        request.resultTypes = [.address, .pointOfInterest]
+        let search = MKLocalSearch(request: request)
+        localSearch = search
+        statusLabel.stringValue = "Ищу: \(query)..."
+
+        search.start { [weak self, weak search] response, error in
+            DispatchQueue.main.async {
+                guard let self, self.searchGeneration == generation,
+                      let search, self.localSearch === search else { return }
+                self.localSearch = nil
+                if let item = response?.mapItems.first {
+                    self.showSearchResult(
+                        coordinate: item.placemark.coordinate,
+                        name: item.name ?? query,
+                        region: nil,
+                        usesOpenStreetMap: false
+                    )
+                } else {
+                    self.loadOSMSearch(query: query, generation: generation, appleError: error)
+                }
+            }
+        }
+    }
+
+    private func loadOSMSearch(query: String, generation: Int, appleError: Error?) {
+        statusLabel.stringValue = "Apple Maps не нашёл место. Ищу через OpenStreetMap..."
+        let elapsed = lastOSMSearchDate.map { Date().timeIntervalSince($0) } ?? 2
+        let delay = max(0, 1.05 - elapsed)
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self, self.searchGeneration == generation else { return }
+            self.searchWorkItem = nil
+            self.lastOSMSearchDate = Date()
+            self.startOSMSearchRequest(query: query, generation: generation, appleError: appleError)
+        }
+        searchWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
+    }
+
+    private func startOSMSearchRequest(query: String, generation: Int, appleError: Error?) {
+        var components = URLComponents(string: "https://nominatim.openstreetmap.org/search")
+        components?.queryItems = [
+            URLQueryItem(name: "q", value: query),
+            URLQueryItem(name: "format", value: "jsonv2"),
+            URLQueryItem(name: "limit", value: "1"),
+            URLQueryItem(name: "accept-language", value: "ru")
+        ]
+        guard let url = components?.url else {
+            statusLabel.stringValue = "Не удалось подготовить поисковый запрос"
+            return
+        }
+
+        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 20)
+        request.setValue("iOS-Location-Controller/0.2.0 (+https://github.com/Plyshkaa/change-geo-ios)", forHTTPHeaderField: "User-Agent")
+        searchTask = routingSession.dataTask(with: request) { [weak self] data, response, error in
+            DispatchQueue.main.async {
+                guard let self, self.searchGeneration == generation else { return }
+                self.searchTask = nil
+                guard let data, data.count <= 1_000_000, error == nil,
+                      (response as? HTTPURLResponse)?.statusCode == 200,
+                      let result = try? JSONDecoder().decode([OSMSearchResult].self, from: data).first,
+                      let latitude = Double(result.latitude),
+                      let longitude = Double(result.longitude) else {
+                    self.statusLabel.stringValue = "Ничего не найдено: \(error?.localizedDescription ?? appleError?.localizedDescription ?? query)"
+                    return
+                }
+
+                let coordinate = CLLocationCoordinate2D(latitude: latitude, longitude: longitude)
+                guard CLLocationCoordinate2DIsValid(coordinate) else {
+                    self.statusLabel.stringValue = "Поиск вернул некорректную координату"
+                    return
+                }
+                let region = self.region(from: result.boundingBox, fallback: coordinate)
+                self.showSearchResult(
+                    coordinate: coordinate,
+                    name: result.displayName,
+                    region: region,
+                    usesOpenStreetMap: true
+                )
+            }
+        }
+        searchTask?.resume()
+    }
+
+    private func region(from boundingBox: [String]?, fallback coordinate: CLLocationCoordinate2D) -> MKCoordinateRegion {
+        guard let boundingBox, boundingBox.count == 4,
+              let south = Double(boundingBox[0]), let north = Double(boundingBox[1]),
+              let west = Double(boundingBox[2]), let east = Double(boundingBox[3]) else {
+            return MKCoordinateRegion(
+                center: coordinate,
+                span: MKCoordinateSpan(latitudeDelta: 0.12, longitudeDelta: 0.12)
+            )
+        }
+        return MKCoordinateRegion(
+            center: coordinate,
+            span: MKCoordinateSpan(
+                latitudeDelta: min(90, max(0.02, abs(north - south) * 1.25)),
+                longitudeDelta: min(180, max(0.02, abs(east - west) * 1.25))
+            )
+        )
+    }
+
+    private func showSearchResult(
+        coordinate: CLLocationCoordinate2D,
+        name: String,
+        region: MKCoordinateRegion?,
+        usesOpenStreetMap: Bool
+    ) {
+        guard CLLocationCoordinate2DIsValid(coordinate) else {
+            statusLabel.stringValue = "Поиск вернул некорректную координату"
+            return
+        }
+        if let annotation = searchAnnotation {
+            mapView.removeAnnotation(annotation)
+        }
+        let annotation = MKPointAnnotation()
+        annotation.title = "Результат поиска"
+        annotation.subtitle = name
+        annotation.coordinate = coordinate
+        searchAnnotation = annotation
+        mapView.addAnnotation(annotation)
+        mapView.setRegion(region ?? MKCoordinateRegion(
+            center: coordinate,
+            span: MKCoordinateSpan(latitudeDelta: 0.12, longitudeDelta: 0.12)
+        ), animated: true)
+        searchUsesOpenStreetMap = usesOpenStreetMap
+        osmAttributionButton.isHidden = !(searchUsesOpenStreetMap || routeUsesOpenStreetMap)
+        statusLabel.stringValue = "Найдено: \(name). Нажмите на карте, чтобы выбрать точку."
     }
 
     private func configureControls() {
@@ -289,6 +527,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, MKMapViewDelegate, NST
         longitudeField.placeholderString = "Долгота"
         latitudeField.delegate = self
         longitudeField.delegate = self
+
+        searchField.placeholderString = "Найти город или адрес"
+        searchField.target = self
+        searchField.action = #selector(searchLocation)
+        searchField.sendsSearchStringImmediately = false
+        searchField.toolTip = "Введите город, улицу или адрес и нажмите Enter"
+
         devicePicker.addItem(withTitle: "Проверить подключение")
 
         updateModeVisibility()
@@ -454,6 +699,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, MKMapViewDelegate, NST
     }
 
     @objc private func modeChanged() {
+        if session != nil { stopSession() }
         updateModeVisibility()
         updateCoordinateLabels()
         updateMap()
@@ -470,6 +716,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, MKMapViewDelegate, NST
     }
 
     @objc private func directionChanged() {
+        if session != nil { stopSession() }
         updateMap()
     }
 
@@ -492,6 +739,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, MKMapViewDelegate, NST
     }
 
     private func select(coordinate: CLLocationCoordinate2D) {
+        if session != nil { stopSession() }
         if modeControl.selectedSegment == 0 {
             endCoordinate = coordinate
         } else if selection == .start {
@@ -537,11 +785,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, MKMapViewDelegate, NST
         routeTask = nil
         osmRouteWorkItem?.cancel()
         osmRouteWorkItem = nil
-        osmAttributionButton.isHidden = true
+        routeUsesOpenStreetMap = false
+        osmAttributionButton.isHidden = !searchUsesOpenStreetMap
         routeCoordinates = []
         routeDistance = 0
         if let routeOverlay {
             mapView.removeOverlay(routeOverlay)
+            self.routeOverlay = nil
+        }
+        if let routeOutlineOverlay {
+            mapView.removeOverlay(routeOutlineOverlay)
+            self.routeOutlineOverlay = nil
         }
         if let startAnnotation {
             mapView.removeAnnotation(startAnnotation)
@@ -674,15 +928,122 @@ final class AppDelegate: NSObject, NSApplicationDelegate, MKMapViewDelegate, NST
         }
         routeCoordinates = coordinates
         routeDistance = distance
-        var points = coordinates
-        let polyline = MKPolyline(coordinates: &points, count: points.count)
+        var outlinePoints = coordinates
+        let outline = MKPolyline(coordinates: &outlinePoints, count: outlinePoints.count)
+        routeOutlineOverlay = outline
+        mapView.addOverlay(outline)
+
+        var routePoints = coordinates
+        let polyline = MKPolyline(coordinates: &routePoints, count: routePoints.count)
         routeOverlay = polyline
         mapView.addOverlay(polyline)
-        mapView.setVisibleMapRect(polyline.boundingMapRect, edgePadding: NSEdgeInsets(top: 42, left: 42, bottom: 42, right: 42), animated: true)
+        mapView.setVisibleMapRect(polyline.boundingMapRect, edgePadding: NSEdgeInsets(top: 58, left: 58, bottom: 58, right: 58), animated: true)
         actionButton.isEnabled = !deviceIDs.isEmpty
-        osmAttributionButton.isHidden = !usesOpenStreetMap
+        routeUsesOpenStreetMap = usesOpenStreetMap
+        osmAttributionButton.isHidden = !(routeUsesOpenStreetMap || searchUsesOpenStreetMap)
         updateCoordinateLabels()
         statusLabel.stringValue = usesOpenStreetMap ? "Маршрут готов · OpenStreetMap" : "Маршрут готов"
+    }
+
+    private func startMovementAnimation() {
+        stopMovementAnimation(removeAnnotation: true)
+        guard routeCoordinates.count > 1 else { return }
+
+        movementCoordinates = routeCoordinates
+        movementCumulativeDistances = [0]
+        var total: CLLocationDistance = 0
+        for (from, to) in zip(routeCoordinates, routeCoordinates.dropFirst()) {
+            total += CLLocation(latitude: from.latitude, longitude: from.longitude)
+                .distance(from: CLLocation(latitude: to.latitude, longitude: to.longitude))
+            movementCumulativeDistances.append(total)
+        }
+        guard total > 0 else { return }
+
+        movementTotalDistance = total
+        movementSpeedMetersPerSecond = max(0.3, speedSlider.doubleValue / 3.6)
+        movementReturnsToStart = directionControl.selectedSegment == 1
+        movementStartDate = Date()
+
+        let annotation = MKPointAnnotation()
+        annotation.title = "Текущее положение на маршруте"
+        annotation.coordinate = routeCoordinates[0]
+        movementAnnotation = annotation
+        mapView.addAnnotation(annotation)
+
+        let timer = Timer(timeInterval: 0.15, repeats: true) { [weak self] _ in
+            self?.updateMovementAnimation()
+        }
+        movementTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func updateMovementAnimation() {
+        guard let startDate = movementStartDate,
+              movementTotalDistance > 0,
+              let annotation = movementAnnotation else {
+            stopMovementAnimation(removeAnnotation: false)
+            return
+        }
+
+        let travelled = max(0, Date().timeIntervalSince(startDate) * movementSpeedMetersPerSecond)
+        let animationDistance = movementReturnsToStart ? movementTotalDistance * 2 : movementTotalDistance
+        let finished = travelled >= animationDistance
+        let clamped = min(travelled, animationDistance)
+        let routeDistance = clamped <= movementTotalDistance
+            ? clamped
+            : max(0, movementTotalDistance * 2 - clamped)
+        annotation.coordinate = coordinateOnMovementRoute(at: routeDistance)
+
+        if finished {
+            movementTimer?.invalidate()
+            movementTimer = nil
+            movementStartDate = nil
+        }
+    }
+
+    private func coordinateOnMovementRoute(at distance: CLLocationDistance) -> CLLocationCoordinate2D {
+        guard movementCoordinates.count > 1,
+              movementCoordinates.count == movementCumulativeDistances.count else {
+            return movementCoordinates.first ?? CLLocationCoordinate2D()
+        }
+        if distance <= 0 { return movementCoordinates[0] }
+        if distance >= movementTotalDistance { return movementCoordinates[movementCoordinates.count - 1] }
+
+        var lower = 1
+        var upper = movementCumulativeDistances.count - 1
+        while lower < upper {
+            let middle = (lower + upper) / 2
+            if movementCumulativeDistances[middle] < distance {
+                lower = middle + 1
+            } else {
+                upper = middle
+            }
+        }
+
+        let toIndex = lower
+        let fromIndex = toIndex - 1
+        let segmentStart = movementCumulativeDistances[fromIndex]
+        let segmentLength = movementCumulativeDistances[toIndex] - segmentStart
+        let fraction = segmentLength > 0 ? (distance - segmentStart) / segmentLength : 0
+        let from = movementCoordinates[fromIndex]
+        let to = movementCoordinates[toIndex]
+        return CLLocationCoordinate2D(
+            latitude: from.latitude + (to.latitude - from.latitude) * fraction,
+            longitude: from.longitude + (to.longitude - from.longitude) * fraction
+        )
+    }
+
+    private func stopMovementAnimation(removeAnnotation: Bool) {
+        movementTimer?.invalidate()
+        movementTimer = nil
+        movementStartDate = nil
+        movementCoordinates = []
+        movementCumulativeDistances = []
+        movementTotalDistance = 0
+        if removeAnnotation, let movementAnnotation {
+            mapView.removeAnnotation(movementAnnotation)
+            self.movementAnnotation = nil
+        }
     }
 
     @objc private func startAction() {
@@ -710,6 +1071,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, MKMapViewDelegate, NST
             var arguments = ["play", gpx.path]
             appendUDID(to: &arguments)
             startSession(arguments: arguments, status: "Маршрут запущен")
+            if session != nil {
+                startMovementAnimation()
+            }
         } catch {
             statusLabel.stringValue = "Не удалось создать маршрут: \(error.localizedDescription)"
         }
@@ -801,10 +1165,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, MKMapViewDelegate, NST
         process.terminationHandler = { [weak self] process in
             DispatchQueue.main.async {
                 guard self?.session === process else { return }
+                let wasAnimatingRoute = self?.movementAnnotation != nil
                 self?.session = nil
                 self?.removeTemporaryGPX()
+                self?.stopMovementAnimation(removeAnnotation: false)
                 if process.terminationStatus != 0 {
                     self?.statusLabel.stringValue = "Backend завершился с кодом \(process.terminationStatus)"
+                } else if wasAnimatingRoute {
+                    self?.statusLabel.stringValue = "Маршрут завершён"
                 }
             }
         }
@@ -819,6 +1187,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, MKMapViewDelegate, NST
     }
 
     private func stopSession() {
+        stopMovementAnimation(removeAnnotation: true)
         if let session, session.isRunning {
             session.interrupt()
             session.waitUntilExit()
@@ -908,8 +1277,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, MKMapViewDelegate, NST
     func mapView(_ mapView: MKMapView, rendererFor overlay: MKOverlay) -> MKOverlayRenderer {
         guard let polyline = overlay as? MKPolyline else { return MKOverlayRenderer(overlay: overlay) }
         let renderer = MKPolylineRenderer(polyline: polyline)
-        renderer.strokeColor = .systemBlue
-        renderer.lineWidth = 4
+        if let outline = routeOutlineOverlay, polyline === outline {
+            renderer.strokeColor = NSColor.black.withAlphaComponent(0.72)
+            renderer.lineWidth = 10
+        } else {
+            renderer.strokeColor = .systemPink
+            renderer.lineWidth = 6
+        }
+        renderer.lineCap = .round
+        renderer.lineJoin = .round
         return renderer
     }
 
@@ -919,14 +1295,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, MKMapViewDelegate, NST
         switch annotation.title ?? nil {
         case "Начальная точка": identifier = "start"
         case "Позиция Mac": identifier = "mac"
+        case "Текущее положение на маршруте": identifier = "movement"
+        case "Результат поиска": identifier = "search"
         default: identifier = "end"
         }
         let view = (mapView.dequeueReusableAnnotationView(withIdentifier: identifier) as? MKMarkerAnnotationView)
             ?? MKMarkerAnnotationView(annotation: annotation, reuseIdentifier: identifier)
         view.annotation = annotation
-        view.markerTintColor = identifier == "start" ? .systemGreen : .systemBlue
-        if identifier == "mac" {
+        view.animatesWhenAdded = true
+        switch identifier {
+        case "start":
+            view.markerTintColor = .systemGreen
+            view.glyphImage = NSImage(systemSymbolName: "flag.fill", accessibilityDescription: nil)
+        case "mac":
+            view.markerTintColor = .systemBlue
             view.glyphImage = NSImage(systemSymbolName: "location.fill", accessibilityDescription: nil)
+        case "movement":
+            view.markerTintColor = .systemOrange
+            view.glyphImage = NSImage(systemSymbolName: "car.fill", accessibilityDescription: nil)
+        case "search":
+            view.markerTintColor = .systemPurple
+            view.glyphImage = NSImage(systemSymbolName: "magnifyingglass", accessibilityDescription: nil)
+        default:
+            view.markerTintColor = .systemRed
+            view.glyphImage = NSImage(systemSymbolName: "mappin", accessibilityDescription: nil)
         }
         return view
     }
