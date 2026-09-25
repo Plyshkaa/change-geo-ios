@@ -392,7 +392,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, MKMapViewDelegate, NST
 
         statusLabel.stringValue = "Core Location не ответил. Определяю приблизительную позицию по сети..."
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 15)
-        request.setValue("iOS-Location-Controller/0.2.0 (+https://github.com/Plyshkaa/change-geo-ios)", forHTTPHeaderField: "User-Agent")
+        request.setValue("iOS-Location-Controller/0.3.0 (+https://github.com/Plyshkaa/change-geo-ios)", forHTTPHeaderField: "User-Agent")
         networkLocationTask = routingSession.dataTask(with: request) { [weak self] data, response, error in
             DispatchQueue.main.async {
                 guard let self, self.locationRequestID == requestID else { return }
@@ -519,7 +519,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, MKMapViewDelegate, NST
         }
 
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 20)
-        request.setValue("iOS-Location-Controller/0.2.0 (+https://github.com/Plyshkaa/change-geo-ios)", forHTTPHeaderField: "User-Agent")
+        request.setValue("iOS-Location-Controller/0.3.0 (+https://github.com/Plyshkaa/change-geo-ios)", forHTTPHeaderField: "User-Agent")
         searchTask = routingSession.dataTask(with: request) { [weak self] data, response, error in
             DispatchQueue.main.async {
                 guard let self, self.searchGeneration == generation else { return }
@@ -1015,7 +1015,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, MKMapViewDelegate, NST
 
     private func startOSMRouteRequest(url: URL, generation: Int, appleError: Error?) {
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 20)
-        request.setValue("iOS-Location-Controller/0.2.0 (+https://github.com/Plyshkaa/change-geo-ios)", forHTTPHeaderField: "User-Agent")
+        request.setValue("iOS-Location-Controller/0.3.0 (+https://github.com/Plyshkaa/change-geo-ios)", forHTTPHeaderField: "User-Agent")
         routeTask = routingSession.dataTask(with: request) { [weak self] data, response, error in
             DispatchQueue.main.async {
                 guard let self, self.routeGeneration == generation else { return }

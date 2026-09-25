@@ -5,6 +5,8 @@ iPhone, подключённого по USB, без jailbreak. Можно най
 выбрать точку, построить маршрут по дорогам с заданной скоростью, наблюдать
 движение маркера по маршруту или вернуть реальную геопозицию.
 
+![Интерфейс iOS Location Controller](docs/ios-location-controller.png)
+
 ## Переносимое приложение
 
 Файл `dist/iOS-Location-Controller-macOS-arm64.zip` содержит готовое
