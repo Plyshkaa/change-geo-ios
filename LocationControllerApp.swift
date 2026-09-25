@@ -36,6 +36,15 @@ private struct OSMSearchResult: Decodable {
     }
 }
 
+private struct IPGeolocationResponse: Decodable {
+    let success: Bool
+    let message: String?
+    let latitude: Double?
+    let longitude: Double?
+    let city: String?
+    let country: String?
+}
+
 private final class ClickableMapView: MKMapView {
     var onMapClick: ((CLLocationCoordinate2D) -> Void)?
 
@@ -61,6 +70,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, MKMapViewDelegate, NST
     private var searchWorkItem: DispatchWorkItem?
     private var lastOSMSearchDate: Date?
     private var searchGeneration = 0
+    private var networkLocationTask: URLSessionDataTask?
     private lazy var routingSession = URLSession(configuration: .ephemeral)
     private var routeCoordinates: [CLLocationCoordinate2D] = []
     private var routeDistance = 0.0
@@ -161,6 +171,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, MKMapViewDelegate, NST
         localSearch?.cancel()
         searchTask?.cancel()
         searchWorkItem?.cancel()
+        networkLocationTask?.cancel()
         routingSession.invalidateAndCancel()
         stopSession()
         return .terminateNow
@@ -260,6 +271,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, MKMapViewDelegate, NST
     }
 
     @objc private func centerOnMyLocation() {
+        networkLocationTask?.cancel()
+        networkLocationTask = nil
         guard CLLocationManager.locationServicesEnabled() else {
             statusLabel.stringValue = "Службы геолокации Mac выключены"
             return
@@ -295,7 +308,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, MKMapViewDelegate, NST
             guard let self, self.isWaitingForMacLocation, self.locationRequestID == requestID else { return }
             self.isWaitingForMacLocation = false
             self.locationManager.stopUpdatingLocation()
-            self.statusLabel.stringValue = "macOS не определила позицию. Проверьте Wi‑Fi и Службы геолокации, затем нажмите кнопку ещё раз."
+            self.requestNetworkLocationFallback(requestID: requestID)
         }
     }
 
@@ -321,21 +334,76 @@ final class AppDelegate: NSObject, NSApplicationDelegate, MKMapViewDelegate, NST
         }
     }
 
-    private func centerMap(on coordinate: CLLocationCoordinate2D) {
-        if let macLocationAnnotation {
-            macLocationAnnotation.coordinate = coordinate
-        } else {
-            let annotation = MKPointAnnotation()
-            annotation.title = "Позиция Mac"
-            annotation.coordinate = coordinate
-            macLocationAnnotation = annotation
-            mapView.addAnnotation(annotation)
+    private func centerMap(
+        on coordinate: CLLocationCoordinate2D,
+        title: String = "Позиция Mac",
+        subtitle: String? = nil,
+        span: CLLocationDegrees = 0.015,
+        status: String = "Карта перемещена к позиции Mac"
+    ) {
+        if let annotation = macLocationAnnotation {
+            mapView.removeAnnotation(annotation)
         }
+        let annotation = MKPointAnnotation()
+        annotation.title = title
+        annotation.subtitle = subtitle
+        annotation.coordinate = coordinate
+        macLocationAnnotation = annotation
+        mapView.addAnnotation(annotation)
         mapView.setRegion(MKCoordinateRegion(
             center: coordinate,
-            span: MKCoordinateSpan(latitudeDelta: 0.015, longitudeDelta: 0.015)
+            span: MKCoordinateSpan(latitudeDelta: span, longitudeDelta: span)
         ), animated: true)
-        statusLabel.stringValue = "Карта перемещена к позиции Mac"
+        statusLabel.stringValue = status
+    }
+
+    private func requestNetworkLocationFallback(requestID: Int) {
+        guard requestID == locationRequestID else { return }
+        var components = URLComponents(string: "https://ipwho.is/")
+        components?.queryItems = [
+            URLQueryItem(name: "fields", value: "success,message,latitude,longitude,city,country")
+        ]
+        guard let url = components?.url else {
+            statusLabel.stringValue = "Не удалось подготовить запрос приблизительной геопозиции"
+            return
+        }
+
+        statusLabel.stringValue = "Core Location не ответил. Определяю приблизительную позицию по сети..."
+        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 15)
+        request.setValue("iOS-Location-Controller/0.2.0 (+https://github.com/Plyshkaa/change-geo-ios)", forHTTPHeaderField: "User-Agent")
+        networkLocationTask = routingSession.dataTask(with: request) { [weak self] data, response, error in
+            DispatchQueue.main.async {
+                guard let self, self.locationRequestID == requestID else { return }
+                self.networkLocationTask = nil
+                guard let data, data.count <= 64_000, error == nil,
+                      (response as? HTTPURLResponse)?.statusCode == 200,
+                      let result = try? JSONDecoder().decode(IPGeolocationResponse.self, from: data),
+                      result.success,
+                      let latitude = result.latitude, let longitude = result.longitude else {
+                    self.statusLabel.stringValue = "Не удалось определить позицию Mac: \(error?.localizedDescription ?? "Core Location и сетевой сервис не вернули координату")"
+                    return
+                }
+
+                let coordinate = CLLocationCoordinate2D(latitude: latitude, longitude: longitude)
+                guard CLLocationCoordinate2DIsValid(coordinate) else {
+                    self.statusLabel.stringValue = "Сетевой сервис вернул некорректную координату"
+                    return
+                }
+                let place = [result.city, result.country]
+                    .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+                    .filter { !$0.isEmpty }
+                    .joined(separator: ", ")
+                let description = place.isEmpty ? "Определено по внешнему IP" : place
+                self.centerMap(
+                    on: coordinate,
+                    title: "Примерная позиция сети",
+                    subtitle: description,
+                    span: 0.25,
+                    status: "Показана приблизительная позиция по IP. VPN может изменить результат."
+                )
+            }
+        }
+        networkLocationTask?.resume()
     }
 
     func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
@@ -1295,6 +1363,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, MKMapViewDelegate, NST
         switch annotation.title ?? nil {
         case "Начальная точка": identifier = "start"
         case "Позиция Mac": identifier = "mac"
+        case "Примерная позиция сети": identifier = "network"
         case "Текущее положение на маршруте": identifier = "movement"
         case "Результат поиска": identifier = "search"
         default: identifier = "end"
@@ -1310,6 +1379,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, MKMapViewDelegate, NST
         case "mac":
             view.markerTintColor = .systemBlue
             view.glyphImage = NSImage(systemSymbolName: "location.fill", accessibilityDescription: nil)
+        case "network":
+            view.markerTintColor = .systemTeal
+            view.glyphImage = NSImage(systemSymbolName: "network", accessibilityDescription: nil)
         case "movement":
             view.markerTintColor = .systemOrange
             view.glyphImage = NSImage(systemSymbolName: "car.fill", accessibilityDescription: nil)
