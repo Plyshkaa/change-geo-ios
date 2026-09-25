@@ -47,11 +47,31 @@ private struct IPGeolocationResponse: Decodable {
 
 private final class ClickableMapView: MKMapView {
     var onMapClick: ((CLLocationCoordinate2D) -> Void)?
+    private var mouseDownPoint: NSPoint?
+    private var didDrag = false
 
     override func mouseDown(with event: NSEvent) {
-        let point = convert(event.locationInWindow, from: nil)
-        onMapClick?(convert(point, toCoordinateFrom: self))
+        mouseDownPoint = convert(event.locationInWindow, from: nil)
+        didDrag = false
         super.mouseDown(with: event)
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        didDrag = true
+        super.mouseDragged(with: event)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        let end = convert(event.locationInWindow, from: nil)
+        let start = mouseDownPoint
+        let wasDrag = didDrag
+        mouseDownPoint = nil
+        didDrag = false
+        super.mouseUp(with: event)
+
+        guard event.clickCount == 1, !wasDrag, let start,
+              hypot(end.x - start.x, end.y - start.y) <= 4 else { return }
+        onMapClick?(convert(end, toCoordinateFrom: self))
     }
 }
 
@@ -103,11 +123,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, MKMapViewDelegate, NST
     private let distanceValue = NSTextField(labelWithString: "Расстояние: -")
     private let statusLabel = NSTextField(labelWithString: "Подключите iPhone по USB")
     private let actionButton = NSButton(title: "Установить геопозицию", target: nil, action: nil)
+    private let pointSelectionButton = NSButton(title: "Выбрать точку на карте", target: nil, action: nil)
     private let routeControls = NSView()
     private let pointControls = NSView()
     private let osmAttributionButton = NSButton(title: "© OpenStreetMap contributors", target: nil, action: nil)
 
     private var selection: PointSelection = .end
+    private var isMapSelectionArmed = false
     private var startCoordinate: CLLocationCoordinate2D?
     private var endCoordinate: CLLocationCoordinate2D?
     private var routeOverlay: MKPolyline?
@@ -185,7 +207,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, MKMapViewDelegate, NST
         mapView.translatesAutoresizingMaskIntoConstraints = false
         mapView.delegate = self
         mapView.onMapClick = { [weak self] coordinate in
-            self?.select(coordinate: coordinate)
+            self?.selectMapCoordinate(coordinate)
         }
         mapView.showsZoomControls = true
         mapView.showsCompass = true
@@ -571,7 +593,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, MKMapViewDelegate, NST
         ), animated: true)
         searchUsesOpenStreetMap = usesOpenStreetMap
         osmAttributionButton.isHidden = !(searchUsesOpenStreetMap || routeUsesOpenStreetMap)
-        statusLabel.stringValue = "Найдено: \(name). Нажмите на карте, чтобы выбрать точку."
+        statusLabel.stringValue = "Найдено: \(name). Сначала включите выбор точки, затем кликните по карте."
     }
 
     private func configureControls() {
@@ -579,7 +601,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, MKMapViewDelegate, NST
         modeControl.target = self
         modeControl.action = #selector(modeChanged)
 
-        selectionControl.selectedSegment = 1
+        selectionControl.selectedSegment = -1
         selectionControl.target = self
         selectionControl.action = #selector(selectionChanged)
 
@@ -601,6 +623,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, MKMapViewDelegate, NST
         searchField.action = #selector(searchLocation)
         searchField.sendsSearchStringImmediately = false
         searchField.toolTip = "Введите город, улицу или адрес и нажмите Enter"
+
+        pointSelectionButton.target = self
+        pointSelectionButton.action = #selector(armPointSelection)
+        pointSelectionButton.bezelStyle = .rounded
 
         devicePicker.addItem(withTitle: "Проверить подключение")
 
@@ -624,7 +650,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, MKMapViewDelegate, NST
         let currentCard = makeLocationCard(title: "Начальная точка", value: currentValue, symbol: "location.fill")
         let destinationCard = makeLocationCard(title: "Пункт назначения", value: destinationValue, symbol: "mappin.and.ellipse")
 
-        let selectionLabel = NSTextField(labelWithString: "Клик по карте задаёт")
+        let selectionLabel = NSTextField(labelWithString: "Выберите точку для следующего клика")
         selectionLabel.font = .systemFont(ofSize: 12, weight: .medium)
 
         let speedLabel = NSTextField(labelWithString: "Скорость")
@@ -652,17 +678,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, MKMapViewDelegate, NST
             distanceValue.widthAnchor.constraint(equalTo: routeStack.widthAnchor)
         ])
 
-        let pointHint = NSTextField(labelWithString: "Нажмите на карте, чтобы выбрать новую координату.")
+        let pointHint = NSTextField(labelWithString: "Карту можно свободно перемещать. Чтобы поставить точку, сначала нажмите кнопку ниже.")
         pointHint.textColor = .secondaryLabelColor
-        pointHint.maximumNumberOfLines = 2
+        pointHint.maximumNumberOfLines = 3
         pointHint.lineBreakMode = .byWordWrapping
-        pointHint.translatesAutoresizingMaskIntoConstraints = false
-        pointControls.addSubview(pointHint)
+        let pointStack = NSStackView(views: [pointHint, pointSelectionButton])
+        pointStack.orientation = .vertical
+        pointStack.alignment = .leading
+        pointStack.spacing = 8
+        pointStack.translatesAutoresizingMaskIntoConstraints = false
+        pointControls.addSubview(pointStack)
         NSLayoutConstraint.activate([
-            pointHint.leadingAnchor.constraint(equalTo: pointControls.leadingAnchor),
-            pointHint.trailingAnchor.constraint(equalTo: pointControls.trailingAnchor),
-            pointHint.topAnchor.constraint(equalTo: pointControls.topAnchor),
-            pointHint.bottomAnchor.constraint(equalTo: pointControls.bottomAnchor)
+            pointStack.leadingAnchor.constraint(equalTo: pointControls.leadingAnchor),
+            pointStack.trailingAnchor.constraint(equalTo: pointControls.trailingAnchor),
+            pointStack.topAnchor.constraint(equalTo: pointControls.topAnchor),
+            pointStack.bottomAnchor.constraint(equalTo: pointControls.bottomAnchor),
+            pointSelectionButton.widthAnchor.constraint(equalTo: pointStack.widthAnchor)
         ])
 
         actionButton.target = self
@@ -774,9 +805,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, MKMapViewDelegate, NST
     }
 
     @objc private func selectionChanged() {
+        guard modeControl.selectedSegment == 1, selectionControl.selectedSegment >= 0 else { return }
         selection = selectionControl.selectedSegment == 0 ? .start : .end
+        isMapSelectionArmed = true
         showSelectedCoordinate()
-        statusLabel.stringValue = selection == .start ? "Выберите начальную точку на карте" : "Выберите конечную точку на карте"
+        statusLabel.stringValue = selection == .start
+            ? "Выбор включён: кликните один раз по карте для начальной точки"
+            : "Выбор включён: кликните один раз по карте для конечной точки"
+    }
+
+    @objc private func armPointSelection() {
+        selection = .end
+        isMapSelectionArmed = true
+        pointSelectionButton.title = "Ожидаю клик по карте…"
+        statusLabel.stringValue = "Выбор включён: кликните один раз по карте"
+    }
+
+    private func disarmMapSelection() {
+        isMapSelectionArmed = false
+        selectionControl.selectedSegment = -1
+        pointSelectionButton.title = "Выбрать точку на карте"
     }
 
     @objc private func speedChanged() {
@@ -797,6 +845,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, MKMapViewDelegate, NST
         if !route {
             selection = .end
         }
+        disarmMapSelection()
         showSelectedCoordinate()
     }
 
@@ -806,14 +855,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, MKMapViewDelegate, NST
         longitudeField.stringValue = coordinate.map { String(format: "%.6f", $0.longitude) } ?? ""
     }
 
-    private func select(coordinate: CLLocationCoordinate2D) {
-        if session != nil { stopSession() }
+    private func selectMapCoordinate(_ coordinate: CLLocationCoordinate2D) {
+        guard isMapSelectionArmed else { return }
+        let target = modeControl.selectedSegment == 1 ? selection : .end
+        disarmMapSelection()
+        applyCoordinate(coordinate, to: target)
+
         if modeControl.selectedSegment == 0 {
+            statusLabel.stringValue = "Точка выбрана. Карту снова можно свободно перемещать."
+        } else if startCoordinate == nil || endCoordinate == nil {
+            statusLabel.stringValue = target == .start
+                ? "Начальная точка выбрана. Теперь выберите «Конец»."
+                : "Конечная точка выбрана. Теперь выберите «Начало»."
+        }
+    }
+
+    private func applyCoordinate(_ coordinate: CLLocationCoordinate2D, to target: PointSelection) {
+        if session != nil { stopSession() }
+        if modeControl.selectedSegment == 0 || target == .end {
             endCoordinate = coordinate
-        } else if selection == .start {
-            startCoordinate = coordinate
         } else {
-            endCoordinate = coordinate
+            startCoordinate = coordinate
         }
         latitudeField.stringValue = String(format: "%.6f", coordinate.latitude)
         longitudeField.stringValue = String(format: "%.6f", coordinate.longitude)
@@ -829,7 +891,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, MKMapViewDelegate, NST
             statusLabel.stringValue = "Введите широту от -90 до 90 и долготу от -180 до 180"
             return
         }
-        select(coordinate: CLLocationCoordinate2D(latitude: latitude, longitude: longitude))
+        let target = modeControl.selectedSegment == 1 ? selection : .end
+        disarmMapSelection()
+        applyCoordinate(CLLocationCoordinate2D(latitude: latitude, longitude: longitude), to: target)
     }
 
     private func updateCoordinateLabels() {
@@ -1148,6 +1212,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, MKMapViewDelegate, NST
     }
 
     @objc private func clearLocation() {
+        disarmMapSelection()
         stopSession()
         var arguments = ["clear"]
         appendUDID(to: &arguments)
